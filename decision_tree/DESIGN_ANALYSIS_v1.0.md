@@ -361,6 +361,143 @@ Current ratio: 0.12 samples per feature per class
 
 ---
 
+## Scaling to Million-Domain Datasets
+
+### Executive Summary for Large-Scale Deployment
+
+To scale the Dom2Vec Application Classifier from the current 144-domain proof-of-concept to millions of unique domains, fundamental architectural changes are required. The current 37.9% accuracy stems from insufficient data relative to feature complexity, and the architecture needs significant optimization for large-scale deployment.
+
+### Key Scaling Challenges
+
+1. **Memory Constraints**
+   - Current: 107D features × 144 samples = negligible memory
+   - At scale: 107D × 1M samples = ~400MB just for features (float32)
+   - Word2Vec vocabulary will explode from 161 to potentially 100K+ unique tokens
+
+2. **Computational Complexity**
+   - Decision trees have O(n log n) training complexity
+   - Single tree on 1M samples would be computationally prohibitive
+   - Inference needs to be sub-millisecond for production use
+
+3. **Data Distribution**
+   - Real-world domains follow power law distribution
+   - 90% of domains might belong to 10% of applications
+   - Need to handle class imbalance and long-tail applications
+
+### Recommended Architecture for Million-Domain Scale
+
+#### Phase 1: Immediate Changes (Before Scaling)
+
+1. **Aggressive Feature Reduction**
+   ```python
+   # From 107D to 30D maximum
+   - Use PCA on embeddings: 100D → 20D
+   - Keep only top 5 structural features
+   - Total: 25D feature vector
+   ```
+
+2. **Replace Decision Tree with Scalable Alternatives**
+   ```python
+   # Option A: LightGBM (recommended)
+   import lightgbm as lgb
+   model = lgb.LGBMClassifier(
+       n_estimators=100,
+       num_leaves=31,
+       learning_rate=0.1,
+       feature_fraction=0.8,
+       bagging_fraction=0.8,
+       bagging_freq=5,
+       verbose=0
+   )
+   
+   # Option B: Linear model with hashing trick
+   from sklearn.linear_model import SGDClassifier
+   from sklearn.feature_extraction import FeatureHasher
+   ```
+
+3. **Implement Streaming Training**
+   ```python
+   # Train in batches of 10K domains
+   for batch in domain_batches:
+       partial_fit(batch)
+   ```
+
+#### Phase 2: Production Architecture
+
+1. **Two-Stage Classification Pipeline**
+   ```
+   Stage 1: Fast Binary Classifiers (One-vs-Rest)
+   - Is it streaming? (Netflix/Spotify/YouTube vs Others)
+   - Is it cloud? (AWS/Azure/GCP vs Others)
+   - Is it social? (Facebook/Twitter/LinkedIn vs Others)
+   
+   Stage 2: Fine-grained Classification
+   - Only run relevant classifiers based on Stage 1
+   - Reduces computational load by 90%
+   ```
+
+2. **Distributed Feature Processing**
+   ```python
+   # Use Apache Spark or Dask for parallel processing
+   - Shard domains by hash
+   - Process embeddings in parallel
+   - Aggregate features using map-reduce
+   ```
+
+3. **Optimized Embedding Strategy**
+   ```python
+   # Replace Word2Vec with:
+   - Bloom filter embeddings for rare tokens
+   - Pre-computed embeddings for top 10K tokens
+   - Character n-grams for OOV handling
+   ```
+
+### Infrastructure Requirements
+
+1. **Training Infrastructure**
+   - 64GB+ RAM for in-memory training
+   - GPU optional but recommended for embedding generation
+   - Distributed storage (HDFS/S3) for domain data
+
+2. **Serving Infrastructure**
+   - Model serving via TensorFlow Serving or MLflow
+   - Redis cache for frequent domain lookups
+   - Load balancing across multiple inference nodes
+
+3. **Monitoring & Updates**
+   - Track prediction confidence distribution
+   - Implement online learning for new domains
+   - A/B testing framework for model updates
+
+### Performance Targets for Production
+
+| Metric | Current | Target (1M domains) |
+|--------|---------|-------------------|
+| Training Time | 0.09s | <1 hour |
+| Inference Latency | - | <10ms p99 |
+| Model Size | ~5MB | <500MB |
+| Accuracy | 37.9% | >85% |
+| Memory Usage | Negligible | <8GB serving |
+
+### Implementation Roadmap
+
+**Month 1**: Feature reduction + LightGBM implementation
+**Month 2**: Distributed training pipeline
+**Month 3**: Two-stage classification architecture  
+**Month 4**: Production deployment + monitoring
+**Month 5**: Online learning implementation
+**Month 6**: Performance optimization + scaling tests
+
+### Critical Success Factors
+
+1. **Data Quality**: Need diverse, representative domain samples
+2. **Feature Engineering**: Domain-specific features more important than embeddings at scale
+3. **Class Balance**: Implement SMOTE or class weights for rare applications
+4. **Incremental Learning**: Must handle new applications without full retraining
+5. **Explainability**: Maintain interpretability despite increased complexity
+
+---
+
 **Document Maintainers**: Technical Analysis Team  
 **Review Cycle**: Quarterly or after major architecture changes  
 **Related Documents**: README.md, requirements.txt, training logs  
