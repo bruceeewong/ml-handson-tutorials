@@ -247,9 +247,29 @@ class Dom2VecAppClassifier:
         # Step 4: Train decision tree with parameterized settings
         print(f"Training decision tree classifier with max_depth={max_depth}...")
         
-        # Split data with parameterized settings
+        # Check class distribution for stratification
+        from collections import Counter
+        class_counts = Counter(y_encoded)
+        min_class_size = min(class_counts.values())
+        
+        print(f"Class distribution: {dict(class_counts)}")
+        print(f"Minimum class size: {min_class_size}")
+        
+        # Determine if stratification is possible
+        min_samples_needed = int(1 / test_size) if test_size < 1.0 else 2
+        use_stratify = min_class_size >= min_samples_needed
+        
+        if not use_stratify:
+            print(f"Warning: Some classes have only {min_class_size} samples.")
+            print(f"Cannot use stratified split (need ≥{min_samples_needed} per class).")
+            print("Using random split instead.")
+        
+        # Split data with conditional stratification
         X_train, X_test, y_train, y_test = train_test_split(
-            X, y_encoded, test_size=test_size, random_state=random_state, stratify=y_encoded
+            X, y_encoded, 
+            test_size=test_size, 
+            random_state=random_state, 
+            stratify=y_encoded if use_stratify else None
         )
         
         # Train decision tree with all provided parameters
@@ -270,7 +290,21 @@ class Dom2VecAppClassifier:
         accuracy = accuracy_score(y_test, y_pred)
         
         # Cross-validation with parameterized CV folds
-        cv_scores = cross_val_score(self.decision_tree, X_train, y_train, cv=cv)
+        # Adjust CV folds if necessary for small classes
+        train_class_counts = Counter(y_train)
+        min_train_class_size = min(train_class_counts.values())
+        
+        # CV requires at least as many samples as folds per class
+        max_cv_folds = min(cv, min_train_class_size)
+        
+        if max_cv_folds < cv:
+            print(f"Warning: Reducing CV folds from {cv} to {max_cv_folds} due to small class sizes")
+        
+        if max_cv_folds < 2:
+            print("Warning: Cannot perform cross-validation with current data. Skipping CV.")
+            cv_scores = np.array([0.0])  # Dummy score
+        else:
+            cv_scores = cross_val_score(self.decision_tree, X_train, y_train, cv=max_cv_folds)
         
         print(f"Training completed!")
         print(f"Test accuracy: {accuracy:.3f}")
