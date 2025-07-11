@@ -24,6 +24,7 @@ MANIFEST
 
 # Virtual Environments
 ml_env/
+ml_env*
 venv/
 env/
 ENV/
