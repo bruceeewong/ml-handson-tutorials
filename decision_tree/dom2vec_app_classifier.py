@@ -49,6 +49,10 @@ class Dom2VecAppClassifier:
         self.training_sentences = []
         self.training_labels = []
         
+        # Track filtered classes
+        self.filtered_classes = set()
+        self.valid_classes = set()
+        
     def prepare_training_sentences(self, training_data: List[Tuple[str, str]]) -> List[List[str]]:
         """
         Prepare training sentences from domain data for Word2Vec training.
@@ -219,7 +223,47 @@ class Dom2VecAppClassifier:
         # Convert DataFrame to training data format
         training_data = list(zip(df[domain_col].values, df[label_col].values))
         
-        print(f"Training on {len(training_data)} domain samples...")
+        # Filter out classes with insufficient samples for stratification
+        min_samples_for_stratify = int(1 / test_size) if test_size < 1.0 else 2
+        
+        # Count samples per class
+        from collections import Counter
+        class_counts = Counter(df[label_col].values)
+        
+        # Identify classes to keep
+        valid_classes = [cls for cls, count in class_counts.items() 
+                        if count >= min_samples_for_stratify]
+        
+        # Store valid and filtered classes for later use
+        self.valid_classes = set(valid_classes)
+        self.filtered_classes = set(class_counts.keys()) - self.valid_classes
+        
+        # Calculate filtering statistics
+        total_classes = len(class_counts)
+        removed_classes = total_classes - len(valid_classes)
+        removed_samples = sum(count for cls, count in class_counts.items() 
+                            if cls not in valid_classes)
+        
+        if removed_classes > 0:
+            print(f"\nClass Distribution Analysis:")
+            print(f"  Total classes: {total_classes}")
+            print(f"  Classes with <{min_samples_for_stratify} samples: {removed_classes} ({removed_classes/total_classes*100:.1f}%)")
+            print(f"  Samples in rare classes: {removed_samples} ({removed_samples/len(training_data)*100:.1f}%)")
+            print(f"  Filtering out {removed_classes} rare classes...")
+            
+            # Show some examples of filtered classes if not too many
+            if removed_classes <= 10:
+                filtered_with_counts = [(cls, class_counts[cls]) for cls in self.filtered_classes]
+                print(f"  Filtered classes: {filtered_with_counts}")
+            
+            # Filter training data
+            training_data = [(domain, label) for domain, label in training_data 
+                           if label in valid_classes]
+            
+            print(f"  Remaining classes: {len(valid_classes)}")
+            print(f"  Remaining samples: {len(training_data)}")
+        
+        print(f"\nTraining on {len(training_data)} domain samples...")
         print(f"Using vector_size={vector_size}, window={window}, workers={workers}")
         
         # Step 1: Prepare sentences for Word2Vec
@@ -247,29 +291,15 @@ class Dom2VecAppClassifier:
         # Step 4: Train decision tree with parameterized settings
         print(f"Training decision tree classifier with max_depth={max_depth}...")
         
-        # Check class distribution for stratification
-        from collections import Counter
-        class_counts = Counter(y_encoded)
-        min_class_size = min(class_counts.values())
+        # Now we can safely use stratification since we filtered out small classes
+        print(f"\nUsing stratified train-test split with test_size={test_size}")
         
-        print(f"Class distribution: {dict(class_counts)}")
-        print(f"Minimum class size: {min_class_size}")
-        
-        # Determine if stratification is possible
-        min_samples_needed = int(1 / test_size) if test_size < 1.0 else 2
-        use_stratify = min_class_size >= min_samples_needed
-        
-        if not use_stratify:
-            print(f"Warning: Some classes have only {min_class_size} samples.")
-            print(f"Cannot use stratified split (need ≥{min_samples_needed} per class).")
-            print("Using random split instead.")
-        
-        # Split data with conditional stratification
+        # Split data with stratification
         X_train, X_test, y_train, y_test = train_test_split(
             X, y_encoded, 
             test_size=test_size, 
             random_state=random_state, 
-            stratify=y_encoded if use_stratify else None
+            stratify=y_encoded  # Always stratify now
         )
         
         # Train decision tree with all provided parameters
@@ -344,6 +374,7 @@ class Dom2VecAppClassifier:
             
         Returns:
             Tuple of (predicted_app, confidence)
+            Note: Returns ('unknown_rare_app', 0.0) for apps that were filtered during training
         """
         if self.decision_tree is None:
             raise ValueError("Model not trained yet!")
@@ -356,6 +387,21 @@ class Dom2VecAppClassifier:
         confidence = np.max(probabilities)
         
         return app_name, confidence
+    
+    def get_filtered_classes_info(self) -> Dict:
+        """
+        Get information about classes that were filtered during training.
+        
+        Returns:
+            Dictionary with filtering statistics
+        """
+        return {
+            'valid_classes': sorted(list(self.valid_classes)),
+            'filtered_classes': sorted(list(self.filtered_classes)),
+            'num_valid_classes': len(self.valid_classes),
+            'num_filtered_classes': len(self.filtered_classes),
+            'filtering_applied': len(self.filtered_classes) > 0
+        }
     
     def get_feature_importance(self, top_n: int = 20) -> pd.DataFrame:
         """Get feature importance from decision tree."""
@@ -403,7 +449,9 @@ class Dom2VecAppClassifier:
             'decision_tree': self.decision_tree,
             'label_encoder': self.label_encoder,
             'feature_names': self.feature_names,
-            'vector_size': self.vector_size
+            'vector_size': self.vector_size,
+            'valid_classes': self.valid_classes,
+            'filtered_classes': self.filtered_classes
         }
         
         with open(filepath, 'wb') as f:
@@ -420,6 +468,8 @@ class Dom2VecAppClassifier:
         self.label_encoder = model_data['label_encoder']
         self.feature_names = model_data['feature_names']
         self.vector_size = model_data['vector_size']
+        self.valid_classes = model_data.get('valid_classes', set())
+        self.filtered_classes = model_data.get('filtered_classes', set())
         
         print(f"Model loaded from {filepath}")
 
