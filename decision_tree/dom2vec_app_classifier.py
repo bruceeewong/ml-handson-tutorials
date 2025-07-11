@@ -75,9 +75,10 @@ class Dom2VecAppClassifier:
         
         return sentences
     
-    def train_word2vec(self, sentences: List[List[str]]) -> None:
+    def train_word2vec(self, sentences: List[List[str]], epochs: int = 10) -> None:
         """Train Word2Vec model on domain sentences."""
         print(f"Training Word2Vec on {len(sentences)} domain sentences...")
+        print(f"Parameters: vector_size={self.vector_size}, window={self.window}, min_count={self.min_count}, workers={self.workers}")
         
         self.word2vec_model = Word2Vec(
             sentences=sentences,
@@ -86,7 +87,7 @@ class Dom2VecAppClassifier:
             min_count=self.min_count,
             workers=self.workers,
             sg=0,  # CBOW
-            epochs=10
+            epochs=epochs
         )
         
         print(f"Word2Vec vocabulary size: {len(self.word2vec_model.wv.key_to_index)}")
@@ -175,25 +176,56 @@ class Dom2VecAppClassifier:
         self.feature_names = embedding_features + additional_features
         return self.feature_names
     
-    def train(self, training_data: Optional[List[Tuple[str, str]]] = None) -> Dict:
+    def train(
+            self, 
+            df: pd.DataFrame,
+            domain_col: str,
+            label_col: str,
+            test_size: float = 0.2,
+            random_state: int = 42,
+            vector_size: int = 50,
+            window: int = 5,
+            workers: int = 4,
+            max_depth: int = 15,
+            min_samples_split: int = 5,
+            min_samples_leaf: int = 2,
+            cv: int = 5,
+        ) -> Dict:
         """
         Train the complete Dom2Vec classifier.
         
         Args:
-            training_data: Optional training data, uses sample data if None
+            df: DataFrame containing training data
+            domain_col: Name of column containing domain names
+            label_col: Name of column containing application labels
+            test_size: Fraction of data to use for testing
+            random_state: Random seed for reproducibility
+            vector_size: Dimension of Word2Vec embeddings
+            window: Context window size for Word2Vec
+            workers: Number of worker threads for Word2Vec
+            max_depth: Maximum depth of decision tree
+            min_samples_split: Minimum samples required to split
+            min_samples_leaf: Minimum samples required at leaf
+            cv: Number of cross-validation folds
             
         Returns:
             Training metrics
         """
-        if training_data is None:
-            training_data = get_all_training_data()
+        # Update instance parameters with provided values
+        self.vector_size = vector_size
+        self.window = window
+        self.workers = workers
+        
+        # Convert DataFrame to training data format
+        training_data = list(zip(df[domain_col].values, df[label_col].values))
         
         print(f"Training on {len(training_data)} domain samples...")
+        print(f"Using vector_size={vector_size}, window={window}, workers={workers}")
         
         # Step 1: Prepare sentences for Word2Vec
         sentences = self.prepare_training_sentences(training_data)
         
-        # Step 2: Train Word2Vec
+        # Step 2: Train Word2Vec with parameterized settings
         self.train_word2vec(sentences)
         
         # Step 3: Extract features for decision tree
@@ -212,20 +244,20 @@ class Dom2VecAppClassifier:
         # Encode labels
         y_encoded = self.label_encoder.fit_transform(y)
         
-        # Step 4: Train decision tree
-        print("Training decision tree classifier...")
+        # Step 4: Train decision tree with parameterized settings
+        print(f"Training decision tree classifier with max_depth={max_depth}...")
         
-        # Split data
+        # Split data with parameterized settings
         X_train, X_test, y_train, y_test = train_test_split(
-            X, y_encoded, test_size=0.2, random_state=42, stratify=y_encoded
+            X, y_encoded, test_size=test_size, random_state=random_state, stratify=y_encoded
         )
         
-        # Train decision tree
+        # Train decision tree with all provided parameters
         self.decision_tree = DecisionTreeClassifier(
-            max_depth=15,
-            min_samples_split=5,
-            min_samples_leaf=2,
-            random_state=42
+            max_depth=max_depth,
+            min_samples_split=min_samples_split,
+            min_samples_leaf=min_samples_leaf,
+            random_state=random_state
         )
         
         self.decision_tree.fit(X_train, y_train)
@@ -237,8 +269,8 @@ class Dom2VecAppClassifier:
         y_pred = self.decision_tree.predict(X_test)
         accuracy = accuracy_score(y_test, y_pred)
         
-        # Cross-validation
-        cv_scores = cross_val_score(self.decision_tree, X_train, y_train, cv=5)
+        # Cross-validation with parameterized CV folds
+        cv_scores = cross_val_score(self.decision_tree, X_train, y_train, cv=cv)
         
         print(f"Training completed!")
         print(f"Test accuracy: {accuracy:.3f}")
@@ -256,7 +288,17 @@ class Dom2VecAppClassifier:
             'cv_mean': cv_scores.mean(),
             'cv_std': cv_scores.std(),
             'test_labels': y_test_labels,
-            'pred_labels': y_pred_labels
+            'pred_labels': y_pred_labels,
+            'training_params': {
+                'vector_size': vector_size,
+                'window': window,
+                'workers': workers,
+                'max_depth': max_depth,
+                'min_samples_split': min_samples_split,
+                'min_samples_leaf': min_samples_leaf,
+                'test_size': test_size,
+                'cv_folds': cv
+            }
         }
     
     def predict(self, domain: str) -> Tuple[str, float]:
@@ -350,11 +392,30 @@ class Dom2VecAppClassifier:
 # Example usage
 if __name__ == "__main__":
     # Initialize classifier
-    classifier = Dom2VecAppClassifier(vector_size=50)  # Smaller for demo
+    classifier = Dom2VecAppClassifier()
     
-    # Train model
+    # Load sample data and convert to DataFrame format
+    from sample_data import get_all_training_data
+    training_data = get_all_training_data()
+    
+    # Convert to DataFrame
+    import pandas as pd
+    df = pd.DataFrame(training_data, columns=['domain', 'application'])
+    
     print("Training Dom2Vec Application Classifier...")
-    metrics = classifier.train()
+    print(f"Dataset: {len(df)} samples, {df['application'].nunique()} applications")
+    
+    # Train model with custom parameters
+    metrics = classifier.train(
+        df=df,
+        domain_col='domain',
+        label_col='application',
+        vector_size=50,  # Smaller for demo
+        window=3,
+        max_depth=10,
+        test_size=0.2,
+        cv=5
+    )
     
     # Test predictions
     test_domains = [
