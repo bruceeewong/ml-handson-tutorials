@@ -10,17 +10,24 @@ from typing import List, Dict, Tuple, Optional
 import pickle
 import joblib
 from pathlib import Path
+import json
+from datetime import datetime
+import hashlib
 
 from gensim.models import Word2Vec
 from sklearn.tree import DecisionTreeClassifier
 from sklearn.model_selection import train_test_split, cross_val_score
-from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, precision_recall_fscore_support
 from sklearn.preprocessing import LabelEncoder
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-from domain_processor import DomainProcessor
-from sample_data import get_all_training_data, get_available_apps
+try:
+    from .domain_processor import DomainProcessor
+    from .sample_data import get_all_training_data, get_available_apps
+except ImportError:
+    from domain_processor import DomainProcessor
+    from sample_data import get_all_training_data, get_available_apps
 
 class Dom2VecAppClassifier:
     def __init__(self, vector_size=100, window=5, min_count=1, workers=4):
@@ -347,6 +354,14 @@ class Dom2VecAppClassifier:
         print("\nClassification Report:")
         print(classification_report(y_test_labels, y_pred_labels))
         
+        # Generate anonymized performance log
+        performance_log = self._generate_performance_log(
+            y_test_labels, y_pred_labels, accuracy, cv_scores,
+            training_data, vector_size, window, workers,
+            max_depth, min_samples_split, min_samples_leaf,
+            test_size, cv, random_state
+        )
+        
         return {
             'accuracy': accuracy,
             'cv_mean': cv_scores.mean(),
@@ -362,7 +377,8 @@ class Dom2VecAppClassifier:
                 'min_samples_leaf': min_samples_leaf,
                 'test_size': test_size,
                 'cv_folds': cv
-            }
+            },
+            'performance_log': performance_log
         }
     
     def predict(self, domain: str) -> Tuple[str, float]:
@@ -387,6 +403,115 @@ class Dom2VecAppClassifier:
         confidence = np.max(probabilities)
         
         return app_name, confidence
+    
+    def _generate_performance_log(self, y_test_labels, y_pred_labels, accuracy, cv_scores,
+                                   training_data, vector_size, window, workers,
+                                   max_depth, min_samples_split, min_samples_leaf,
+                                   test_size, cv, random_state) -> Dict:
+        """Generate anonymized performance log for sharing."""
+        # Get unique classes and create anonymized mapping
+        unique_classes = sorted(set(y_test_labels) | set(y_pred_labels))
+        class_mapping = {cls: f"app_{i:03d}" for i, cls in enumerate(unique_classes)}
+        
+        # Calculate per-class metrics
+        precision, recall, f1, support = precision_recall_fscore_support(
+            y_test_labels, y_pred_labels, labels=unique_classes, average=None, zero_division=0
+        )
+        
+        # Create anonymized per-class results
+        per_class_metrics = []
+        for i, cls in enumerate(unique_classes):
+            anon_name = class_mapping[cls]
+            per_class_metrics.append({
+                'class': anon_name,
+                'precision': float(precision[i]),
+                'recall': float(recall[i]),
+                'f1_score': float(f1[i]),
+                'support': int(support[i])
+            })
+        
+        # Sort by F1 score descending
+        per_class_metrics.sort(key=lambda x: x['f1_score'], reverse=True)
+        
+        # Calculate macro and weighted averages
+        macro_precision, macro_recall, macro_f1, _ = precision_recall_fscore_support(
+            y_test_labels, y_pred_labels, average='macro', zero_division=0
+        )
+        weighted_precision, weighted_recall, weighted_f1, _ = precision_recall_fscore_support(
+            y_test_labels, y_pred_labels, average='weighted', zero_division=0
+        )
+        
+        # Create confusion matrix with anonymized labels
+        cm = confusion_matrix(y_test_labels, y_pred_labels, labels=unique_classes)
+        anon_labels = [class_mapping[cls] for cls in unique_classes]
+        
+        # Dataset statistics
+        class_distribution = {}
+        for _, label in training_data:
+            if label in self.valid_classes:
+                anon_label = class_mapping.get(label, f"filtered_{label}")
+                class_distribution[anon_label] = class_distribution.get(anon_label, 0) + 1
+        
+        # Generate timestamp and run ID
+        timestamp = datetime.now().isoformat()
+        run_id = hashlib.md5(f"{timestamp}{random_state}".encode()).hexdigest()[:8]
+        
+        log = {
+            "run_id": run_id,
+            "timestamp": timestamp,
+            "model_configuration": {
+                "model_type": "Dom2Vec + DecisionTree",
+                "word2vec_params": {
+                    "vector_size": vector_size,
+                    "window": window,
+                    "min_count": self.min_count,
+                    "workers": workers,
+                    "algorithm": "CBOW"
+                },
+                "decision_tree_params": {
+                    "max_depth": max_depth,
+                    "min_samples_split": min_samples_split,
+                    "min_samples_leaf": min_samples_leaf,
+                    "random_state": random_state
+                },
+                "training_params": {
+                    "test_size": test_size,
+                    "cv_folds": cv,
+                    "stratified": True
+                }
+            },
+            "dataset_info": {
+                "total_samples": len(training_data),
+                "total_classes": len(self.valid_classes),
+                "filtered_classes": len(self.filtered_classes),
+                "class_distribution": class_distribution,
+                "vocabulary_size": len(self.word2vec_model.wv.key_to_index) if self.word2vec_model else 0
+            },
+            "overall_performance": {
+                "test_accuracy": float(accuracy),
+                "cv_mean_accuracy": float(cv_scores.mean()),
+                "cv_std_accuracy": float(cv_scores.std()),
+                "macro_precision": float(macro_precision),
+                "macro_recall": float(macro_recall),
+                "macro_f1": float(macro_f1),
+                "weighted_precision": float(weighted_precision),
+                "weighted_recall": float(weighted_recall),
+                "weighted_f1": float(weighted_f1)
+            },
+            "per_class_performance": per_class_metrics,
+            "confusion_matrix": {
+                "labels": anon_labels,
+                "matrix": cm.tolist()
+            },
+            "notes": {
+                "anonymized": True,
+                "class_mapping_hash": hashlib.md5(str(sorted(class_mapping.items())).encode()).hexdigest()[:8],
+                "filtered_class_count": len(self.filtered_classes),
+                "filtering_reason": f"Classes with <{int(1/test_size)} samples were filtered"
+            }
+        }
+        
+        return log
     
     def get_filtered_classes_info(self) -> Dict:
         """
@@ -441,6 +566,86 @@ class Dom2VecAppClassifier:
         plt.yticks(rotation=0)
         plt.tight_layout()
         plt.show()
+    
+    def save_performance_log(self, log: Dict, filepath: str = None) -> str:
+        """Save performance log to JSON file.
+        
+        Args:
+            log: Performance log dictionary
+            filepath: Optional filepath. If None, generates timestamped filename
+            
+        Returns:
+            Path to saved file
+        """
+        if filepath is None:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filepath = f"performance_log_{log['run_id']}_{timestamp}.json"
+        
+        with open(filepath, 'w') as f:
+            json.dump(log, f, indent=2)
+        
+        print(f"Performance log saved to: {filepath}")
+        return filepath
+    
+    def format_performance_summary(self, log: Dict) -> str:
+        """Format performance log as readable summary for sharing.
+        
+        Args:
+            log: Performance log dictionary
+            
+        Returns:
+            Formatted string summary
+        """
+        summary = []
+        summary.append("="*60)
+        summary.append("MODEL PERFORMANCE SUMMARY (ANONYMIZED)")
+        summary.append("="*60)
+        summary.append(f"Run ID: {log['run_id']}")
+        summary.append(f"Timestamp: {log['timestamp']}")
+        
+        # Model configuration
+        summary.append("\nMODEL CONFIGURATION:")
+        summary.append(f"  Model Type: {log['model_configuration']['model_type']}")
+        summary.append(f"  Word2Vec: vector_size={log['model_configuration']['word2vec_params']['vector_size']}, "
+                      f"window={log['model_configuration']['word2vec_params']['window']}")
+        summary.append(f"  Decision Tree: max_depth={log['model_configuration']['decision_tree_params']['max_depth']}, "
+                      f"min_samples_split={log['model_configuration']['decision_tree_params']['min_samples_split']}")
+        summary.append(f"  Training: test_size={log['model_configuration']['training_params']['test_size']}, "
+                      f"cv_folds={log['model_configuration']['training_params']['cv_folds']}")
+        
+        # Dataset info
+        summary.append("\nDATASET INFO:")
+        summary.append(f"  Total Samples: {log['dataset_info']['total_samples']}")
+        summary.append(f"  Valid Classes: {log['dataset_info']['total_classes']}")
+        summary.append(f"  Filtered Classes: {log['dataset_info']['filtered_classes']}")
+        summary.append(f"  Vocabulary Size: {log['dataset_info']['vocabulary_size']}")
+        
+        # Overall performance
+        summary.append("\nOVERALL PERFORMANCE:")
+        summary.append(f"  Test Accuracy: {log['overall_performance']['test_accuracy']:.3f}")
+        summary.append(f"  CV Accuracy: {log['overall_performance']['cv_mean_accuracy']:.3f} ± "
+                      f"{log['overall_performance']['cv_std_accuracy']:.3f}")
+        summary.append(f"  Macro F1: {log['overall_performance']['macro_f1']:.3f}")
+        summary.append(f"  Weighted F1: {log['overall_performance']['weighted_f1']:.3f}")
+        
+        # Per-class performance (top 10)
+        summary.append("\nPER-CLASS PERFORMANCE (Top 10 by F1 Score):")
+        summary.append(f"{'Class':<10} {'Precision':<10} {'Recall':<10} {'F1-Score':<10} {'Support':<10}")
+        summary.append("-"*50)
+        
+        for i, metrics in enumerate(log['per_class_performance'][:10]):
+            summary.append(f"{metrics['class']:<10} {metrics['precision']:<10.3f} "
+                          f"{metrics['recall']:<10.3f} {metrics['f1_score']:<10.3f} "
+                          f"{metrics['support']:<10}")
+        
+        # Notes
+        summary.append("\nNOTES:")
+        for key, value in log['notes'].items():
+            summary.append(f"  {key}: {value}")
+        
+        summary.append("="*60)
+        
+        return "\n".join(summary)
     
     def save_model(self, filepath: str) -> None:
         """Save the trained model."""
