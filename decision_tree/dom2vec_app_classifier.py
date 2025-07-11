@@ -59,6 +59,7 @@ class Dom2VecAppClassifier:
         # Track filtered classes
         self.filtered_classes = set()
         self.valid_classes = set()
+        self._performance_log = None
         
     def prepare_training_sentences(self, training_data: List[Tuple[str, str]]) -> List[List[str]]:
         """
@@ -226,6 +227,7 @@ class Dom2VecAppClassifier:
         self.vector_size = vector_size
         self.window = window
         self.workers = workers
+        self._performance_log = None
         
         # Convert DataFrame to training data format
         training_data = list(zip(df[domain_col].values, df[label_col].values))
@@ -355,7 +357,7 @@ class Dom2VecAppClassifier:
         print(classification_report(y_test_labels, y_pred_labels))
         
         # Generate anonymized performance log
-        performance_log = self._generate_performance_log(
+        self._performance_log = self._generate_performance_log(
             y_test_labels, y_pred_labels, accuracy, cv_scores,
             training_data, vector_size, window, workers,
             max_depth, min_samples_split, min_samples_leaf,
@@ -377,9 +379,14 @@ class Dom2VecAppClassifier:
                 'min_samples_leaf': min_samples_leaf,
                 'test_size': test_size,
                 'cv_folds': cv
-            },
-            'performance_log': performance_log
+            }
         }
+    
+    def get_performance_log(self) -> Dict:
+        """Get the performance log."""
+        if self._performance_log is None:
+            raise ValueError("Model not trained yet!")
+        return self._performance_log
     
     def predict(self, domain: str) -> Tuple[str, float]:
         """
