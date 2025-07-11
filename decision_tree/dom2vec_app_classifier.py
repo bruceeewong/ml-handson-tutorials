@@ -379,7 +379,8 @@ class Dom2VecAppClassifier:
                 'min_samples_leaf': min_samples_leaf,
                 'test_size': test_size,
                 'cv_folds': cv
-            }
+            },
+            'performance_log': self._performance_log
         }
     
     def get_performance_log(self) -> Dict:
@@ -414,7 +415,7 @@ class Dom2VecAppClassifier:
     def _generate_performance_log(self, y_test_labels, y_pred_labels, accuracy, cv_scores,
                                    training_data, vector_size, window, workers,
                                    max_depth, min_samples_split, min_samples_leaf,
-                                   test_size, cv, random_state) -> Dict:
+                                   test_size, cv, random_state, compact=True) -> Dict:
         """Generate anonymized performance log for sharing."""
         # Get unique classes and create anonymized mapping
         unique_classes = sorted(set(y_test_labels) | set(y_pred_labels))
@@ -452,12 +453,44 @@ class Dom2VecAppClassifier:
         cm = confusion_matrix(y_test_labels, y_pred_labels, labels=unique_classes)
         anon_labels = [class_mapping[cls] for cls in unique_classes]
         
-        # Dataset statistics
+        # For large datasets, create compact versions
+        num_classes = len(unique_classes)
+        use_compact = compact and num_classes > 20
+        
+        # Handle confusion matrix
+        if use_compact:
+            # Instead of full matrix, provide summary statistics
+            cm_summary = self._summarize_confusion_matrix(cm, anon_labels)
+            confusion_data = cm_summary
+        else:
+            confusion_data = {
+                "labels": anon_labels,
+                "matrix": cm.tolist()
+            }
+        
+        # Handle per-class performance
+        if use_compact:
+            # Provide top/bottom performers and statistics
+            per_class_summary = self._summarize_per_class_performance(
+                per_class_metrics, num_top=10, num_bottom=5
+            )
+            per_class_data = per_class_summary
+        else:
+            per_class_data = per_class_metrics
+        
+        # Handle class distribution
         class_distribution = {}
         for _, label in training_data:
             if label in self.valid_classes:
                 anon_label = class_mapping.get(label, f"filtered_{label}")
                 class_distribution[anon_label] = class_distribution.get(anon_label, 0) + 1
+        
+        if use_compact:
+            # Provide distribution statistics instead of full list
+            distribution_summary = self._summarize_class_distribution(class_distribution)
+            distribution_data = distribution_summary
+        else:
+            distribution_data = class_distribution
         
         # Generate timestamp and run ID
         timestamp = datetime.now().isoformat()
@@ -491,7 +524,7 @@ class Dom2VecAppClassifier:
                 "total_samples": len(training_data),
                 "total_classes": len(self.valid_classes),
                 "filtered_classes": len(self.filtered_classes),
-                "class_distribution": class_distribution,
+                "class_distribution": distribution_data,
                 "vocabulary_size": len(self.word2vec_model.wv.key_to_index) if self.word2vec_model else 0
             },
             "overall_performance": {
@@ -505,13 +538,12 @@ class Dom2VecAppClassifier:
                 "weighted_recall": float(weighted_recall),
                 "weighted_f1": float(weighted_f1)
             },
-            "per_class_performance": per_class_metrics,
-            "confusion_matrix": {
-                "labels": anon_labels,
-                "matrix": cm.tolist()
-            },
+            "per_class_performance": per_class_data,
+            "confusion_matrix": confusion_data,
             "notes": {
                 "anonymized": True,
+                "compact_format": use_compact,
+                "num_classes": num_classes,
                 "class_mapping_hash": hashlib.md5(str(sorted(class_mapping.items())).encode()).hexdigest()[:8],
                 "filtered_class_count": len(self.filtered_classes),
                 "filtering_reason": f"Classes with <{int(1/test_size)} samples were filtered"
@@ -519,6 +551,147 @@ class Dom2VecAppClassifier:
         }
         
         return log
+    
+    def _summarize_confusion_matrix(self, cm: np.ndarray, labels: List[str]) -> Dict:
+        """Create compact summary of confusion matrix for large datasets."""
+        n_classes = len(labels)
+        
+        # Calculate confusion matrix statistics
+        diagonal_sum = np.trace(cm)
+        total_predictions = np.sum(cm)
+        off_diagonal_sum = total_predictions - diagonal_sum
+        
+        # Find top confusion pairs (most common misclassifications)
+        confusion_pairs = []
+        for i in range(n_classes):
+            for j in range(n_classes):
+                if i != j and cm[i, j] > 0:
+                    confusion_pairs.append((labels[i], labels[j], int(cm[i, j])))
+        
+        # Sort by confusion count and take top 10
+        confusion_pairs.sort(key=lambda x: x[2], reverse=True)
+        top_confusions = confusion_pairs[:10]
+        
+        # Calculate per-class accuracy (diagonal / row sum)
+        class_accuracies = []
+        for i in range(n_classes):
+            row_sum = np.sum(cm[i, :])
+            if row_sum > 0:
+                accuracy = cm[i, i] / row_sum
+                class_accuracies.append((labels[i], float(accuracy)))
+        
+        class_accuracies.sort(key=lambda x: x[1])
+        worst_classes = class_accuracies[:5]
+        best_classes = class_accuracies[-5:]
+        
+        return {
+            "format": "compact_summary",
+            "total_predictions": int(total_predictions),
+            "correct_predictions": int(diagonal_sum),
+            "misclassifications": int(off_diagonal_sum),
+            "overall_accuracy": float(diagonal_sum / total_predictions) if total_predictions > 0 else 0.0,
+            "top_confusion_pairs": [
+                {"true_class": pair[0], "predicted_class": pair[1], "count": pair[2]}
+                for pair in top_confusions
+            ],
+            "worst_performing_classes": [
+                {"class": cls, "class_accuracy": acc} for cls, acc in worst_classes
+            ],
+            "best_performing_classes": [
+                {"class": cls, "class_accuracy": acc} for cls, acc in best_classes
+            ]
+        }
+    
+    def _summarize_per_class_performance(self, per_class_metrics: List[Dict], 
+                                       num_top: int = 10, num_bottom: int = 5) -> Dict:
+        """Create compact summary of per-class performance for large datasets."""
+        if not per_class_metrics:
+            return {"format": "compact_summary", "top_performers": [], "bottom_performers": [], "statistics": {}}
+        
+        # Extract metrics for statistics
+        f1_scores = [m['f1_score'] for m in per_class_metrics]
+        precisions = [m['precision'] for m in per_class_metrics]
+        recalls = [m['recall'] for m in per_class_metrics]
+        
+        # Calculate statistics
+        stats = {
+            "f1_score": {
+                "mean": float(np.mean(f1_scores)),
+                "median": float(np.median(f1_scores)),
+                "std": float(np.std(f1_scores)),
+                "min": float(np.min(f1_scores)),
+                "max": float(np.max(f1_scores))
+            },
+            "precision": {
+                "mean": float(np.mean(precisions)),
+                "median": float(np.median(precisions))
+            },
+            "recall": {
+                "mean": float(np.mean(recalls)),
+                "median": float(np.median(recalls))
+            }
+        }
+        
+        # Performance tiers
+        excellent = [m for m in per_class_metrics if m['f1_score'] >= 0.8]
+        good = [m for m in per_class_metrics if 0.6 <= m['f1_score'] < 0.8]
+        moderate = [m for m in per_class_metrics if 0.4 <= m['f1_score'] < 0.6]
+        poor = [m for m in per_class_metrics if m['f1_score'] < 0.4]
+        
+        return {
+            "format": "compact_summary",
+            "total_classes": len(per_class_metrics),
+            "top_performers": per_class_metrics[:num_top],
+            "bottom_performers": per_class_metrics[-num_bottom:],
+            "statistics": stats,
+            "performance_tiers": {
+                "excellent_f1_ge_0.8": len(excellent),
+                "good_f1_0.6_to_0.8": len(good),
+                "moderate_f1_0.4_to_0.6": len(moderate),
+                "poor_f1_lt_0.4": len(poor)
+            }
+        }
+    
+    def _summarize_class_distribution(self, class_distribution: Dict[str, int]) -> Dict:
+        """Create compact summary of class distribution for large datasets."""
+        if not class_distribution:
+            return {"format": "compact_summary", "statistics": {}, "distribution_bins": {}}
+        
+        counts = list(class_distribution.values())
+        
+        # Calculate statistics
+        stats = {
+            "total_classes": len(class_distribution),
+            "total_samples": sum(counts),
+            "mean_samples_per_class": float(np.mean(counts)),
+            "median_samples_per_class": float(np.median(counts)),
+            "std_samples_per_class": float(np.std(counts)),
+            "min_samples": int(np.min(counts)),
+            "max_samples": int(np.max(counts))
+        }
+        
+        # Create distribution bins
+        bins = {
+            "1_sample": len([c for c in counts if c == 1]),
+            "2_5_samples": len([c for c in counts if 2 <= c <= 5]),
+            "6_20_samples": len([c for c in counts if 6 <= c <= 20]),
+            "21_100_samples": len([c for c in counts if 21 <= c <= 100]),
+            "101_500_samples": len([c for c in counts if 101 <= c <= 500]),
+            "over_500_samples": len([c for c in counts if c > 500])
+        }
+        
+        # Show extreme classes (very large or very small)
+        sorted_classes = sorted(class_distribution.items(), key=lambda x: x[1])
+        smallest_classes = sorted_classes[:5]
+        largest_classes = sorted_classes[-5:]
+        
+        return {
+            "format": "compact_summary",
+            "statistics": stats,
+            "distribution_bins": bins,
+            "smallest_classes": [{"class": cls, "count": count} for cls, count in smallest_classes],
+            "largest_classes": [{"class": cls, "count": count} for cls, count in largest_classes]
+        }
     
     def get_filtered_classes_info(self) -> Dict:
         """
@@ -635,15 +808,61 @@ class Dom2VecAppClassifier:
         summary.append(f"  Macro F1: {log['overall_performance']['macro_f1']:.3f}")
         summary.append(f"  Weighted F1: {log['overall_performance']['weighted_f1']:.3f}")
         
-        # Per-class performance (top 10)
-        summary.append("\nPER-CLASS PERFORMANCE (Top 10 by F1 Score):")
-        summary.append(f"{'Class':<10} {'Precision':<10} {'Recall':<10} {'F1-Score':<10} {'Support':<10}")
-        summary.append("-"*50)
+        # Per-class performance - handle both formats
+        per_class_data = log['per_class_performance']
+        if isinstance(per_class_data, dict) and per_class_data.get('format') == 'compact_summary':
+            # Compact format
+            summary.append("\nPER-CLASS PERFORMANCE SUMMARY:")
+            summary.append(f"  Total Classes: {per_class_data['total_classes']}")
+            summary.append(f"  F1 Statistics: mean={per_class_data['statistics']['f1_score']['mean']:.3f}, "
+                          f"std={per_class_data['statistics']['f1_score']['std']:.3f}")
+            summary.append(f"  Performance Tiers:")
+            for tier, count in per_class_data['performance_tiers'].items():
+                summary.append(f"    {tier.replace('_', ' ')}: {count} classes")
+            
+            summary.append(f"\n  Top {len(per_class_data['top_performers'])} Performers:")
+            for metrics in per_class_data['top_performers'][:5]:
+                summary.append(f"    {metrics['class']}: F1={metrics['f1_score']:.3f}")
+            
+            summary.append(f"\n  Bottom {len(per_class_data['bottom_performers'])} Performers:")
+            for metrics in per_class_data['bottom_performers']:
+                summary.append(f"    {metrics['class']}: F1={metrics['f1_score']:.3f}")
+        else:
+            # Full format (original)
+            summary.append("\nPER-CLASS PERFORMANCE (Top 10 by F1 Score):")
+            summary.append(f"{'Class':<10} {'Precision':<10} {'Recall':<10} {'F1-Score':<10} {'Support':<10}")
+            summary.append("-"*50)
+            
+            for metrics in per_class_data[:10]:
+                summary.append(f"{metrics['class']:<10} {metrics['precision']:<10.3f} "
+                              f"{metrics['recall']:<10.3f} {metrics['f1_score']:<10.3f} "
+                              f"{metrics['support']:<10}")
         
-        for i, metrics in enumerate(log['per_class_performance'][:10]):
-            summary.append(f"{metrics['class']:<10} {metrics['precision']:<10.3f} "
-                          f"{metrics['recall']:<10.3f} {metrics['f1_score']:<10.3f} "
-                          f"{metrics['support']:<10}")
+        # Confusion matrix summary
+        confusion_data = log['confusion_matrix']
+        if isinstance(confusion_data, dict) and confusion_data.get('format') == 'compact_summary':
+            summary.append("\nCONFUSION MATRIX SUMMARY:")
+            summary.append(f"  Total Predictions: {confusion_data['total_predictions']}")
+            summary.append(f"  Correct: {confusion_data['correct_predictions']} "
+                          f"({confusion_data['overall_accuracy']:.3f})")
+            summary.append(f"  Misclassifications: {confusion_data['misclassifications']}")
+            
+            if confusion_data['top_confusion_pairs']:
+                summary.append(f"\n  Top Confusion Pairs:")
+                for pair in confusion_data['top_confusion_pairs'][:5]:
+                    summary.append(f"    {pair['true_class']} → {pair['predicted_class']}: {pair['count']} times")
+        
+        # Class distribution summary
+        dist_data = log['dataset_info']['class_distribution']
+        if isinstance(dist_data, dict) and dist_data.get('format') == 'compact_summary':
+            summary.append("\nCLASS DISTRIBUTION SUMMARY:")
+            stats = dist_data['statistics']
+            summary.append(f"  Mean samples per class: {stats['mean_samples_per_class']:.1f}")
+            summary.append(f"  Range: {stats['min_samples']} - {stats['max_samples']} samples")
+            summary.append(f"  Distribution bins:")
+            for bin_name, count in dist_data['distribution_bins'].items():
+                if count > 0:
+                    summary.append(f"    {bin_name.replace('_', ' ')}: {count} classes")
         
         # Notes
         summary.append("\nNOTES:")
